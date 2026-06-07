@@ -1,0 +1,11 @@
+# Provided exercise data files
+provided/
+
+# Pipeline output
+staging/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
