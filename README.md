@@ -241,29 +241,30 @@ into memory.
 ## Deliverable 5 — AI Usage: Authoring
 
 This pipeline was built with Claude Code as an interactive coding assistant. The
-following shows one prompt that was iterated on during development of the Tier 2
-LLM matching logic.
+testing approach went through three iterations.
 
-**First version of the matching prompt (sent to claude-opus-4-8):**
+**First version:** No tests at all. The pipeline ran and produced output, but there
+was no automated way to verify correctness after changes.
 
-> You are a product matching expert. Given a product submission and a list of
-> catalog entries, decide if the submission matches any catalog entry. Return your
-> decision as a JSON object with fields: product_id, confidence, reason.
+**What was wrong:** Any edit to matching logic, validation rules, or output format
+could silently break expected behaviour with no safety net.
 
-**What was wrong:** The model returned freeform JSON inside a markdown code block,
-requiring fragile regex parsing. The instruction "return JSON" also gave no signal
-about confidence calibration — the model consistently returned confidence of 0.9+
-for partial matches, which would have caused false positives.
+**Second version:** Integration tests using pytest (`tests/test_pipeline.py`). A
+session-scoped fixture runs the full pipeline once against the provided data, then
+individual test classes assert on counts, specific decisions, required fields, and
+summary totals. This covered the golden path — correct inputs producing correct
+outputs.
 
-**Revised version (what ships):** Tool use replaces freeform JSON. The
-`record_match_decision` tool schema enforces the exact output shape at the API
-level — no parsing needed. The prompt now includes explicit calibration rules:
+**What was still missing:** The pipeline had a stated constraint that partial failure
+must be safe to resume. The integration tests passed on a clean run but said nothing
+about crash recovery. When the checkpoint system was implemented, there was no test
+to verify it actually worked.
 
-> *False positives are worse than false negatives: when uncertain, lower your
-> confidence and let the human review. Set confidence >= 0.85 only when you are
-> genuinely certain of the decision.*
-
-This produced well-calibrated confidence scores and eliminated the parsing problem.
+**Third version (what ships):** `TestCheckpointResume` was added. It patches
+`append_record` to raise a `RuntimeError` after three writes, verifies the checkpoint
+file exists with partial progress, then re-runs the pipeline and asserts that the
+final output is complete with no record appearing twice. This is the test that
+actually exercises the constraint the code was written to satisfy.
 
 ---
 
