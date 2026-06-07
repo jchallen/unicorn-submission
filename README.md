@@ -1,8 +1,8 @@
 # Product Matching Pipeline
 
-A deterministic pipeline that ingests product submissions, validates them, deduplicates,
-and matches them against a canonical catalog. Ambiguous records are routed to a human
-review queue for LLM-assisted resolution in Tier 2.
+A two-tier pipeline that ingests product submissions, validates them, deduplicates,
+and matches them against a canonical catalog. Tier 1 uses deterministic rules; Tier 2
+uses Claude (claude-opus-4-8) to resolve the records Tier 1 could not confidently match.
 
 ---
 
@@ -16,18 +16,26 @@ pip install -r requirements.txt
 
 ## Running
 
+**Tier 1 — deterministic matching:**
+
 ```bash
 python run.py
 ```
 
-By default this reads from `provided/product_matching_submissions.json` and
-`provided/product_catalog.json`. You can pass custom paths as arguments:
+**Tier 2 — LLM-assisted matching** (run after Tier 1):
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+python run_tier2.py
+```
+
+Both scripts read from `provided/` and write output to `staging/`. You can pass custom
+paths as positional arguments:
 
 ```bash
 python run.py path/to/submissions.json path/to/catalog.json
+python run_tier2.py path/to/submissions.json path/to/catalog.json
 ```
-
-Output is written to `staging/`. Nothing in the catalog or source files is modified.
 
 ## Running Tests
 
@@ -35,44 +43,19 @@ Output is written to `staging/`. Nothing in the catalog or source files is modif
 pytest
 ```
 
----
+## Generating Eval Report
 
-## Data Flow
+```bash
+python eval.py
+```
 
-```
-submissions.json
-      │
-      ▼
-  [ ingest ]        stream_submissions() yields one record at a time
-      │
-      ▼
-  [ validate ]      checks required fields, allowed sizes, vintage range
-      │
-      ├── invalid ──────────────────────────────► staging/invalid.json
-      │
-      ▼
-  [ deduplicate ]   exact (same submission_id) and near (same content)
-      │
-      ├── exact_duplicates ─────────────────────► staging/exact_duplicates.json
-      ├── near_duplicates ──────────────────────► staging/near_duplicates.json
-      │
-      ▼
-  [ match ]         normalised string + alias lookup, then attribute gates
-      │
-      ├── exact_match ──────────────────────────► staging/matched.json
-      ├── no_match ─────────────────────────────► staging/no_match.json
-      └── human_review ─────────────────────────► staging/human_review.json
-                                                   (input queue for Tier 2)
-      │
-      ▼
-  [ report ]        writes summary.json and prints counts to terminal
-```
+Reads current staging output and writes `staging/product_matching_eval.json`.
 
 ---
 
-## Approach and Tradeoffs
+## Deliverable 1 — Approach & Tradeoffs
 
-### Tier 1 — Deterministic Core (implemented)
+### Tier 1 — Deterministic Core
 
 The pipeline is split into five stages, each in its own module, with no stage
 reaching into another's concerns. Validation never writes files. Matching never
@@ -124,47 +107,90 @@ Cabernet") is a good example — the catalog entry is "Screaming Eagle Cabernet
 Sauvignon" and no alias matches exactly, so it is left unmatched for Tier 2 rather
 than risk a wrong commit.
 
-### What Tier 1 leaves unmatched (for Tier 2)
+### What Tier 1 leaves unmatched (Tier 2 input)
 
-| Submission | Reason |
+| Submission | Reason left unmatched by Tier 1 |
 |---|---|
-| SUB-2003 | "Fifteen" vs "15", producer alias mismatch |
+| SUB-2003 | "Fifteen" vs "15" — no alias match |
 | SUB-2004 | Size mismatch (700ml submitted, 750ml in catalog) |
+| SUB-2005 | Not in catalog at all |
 | SUB-2007 | Vintage missing — ambiguous between two catalog entries |
-| SUB-2009 | Partial name, no exact alias in catalog |
+| SUB-2008 | Too generic — "Reserve Red Wine" matches no alias |
+| SUB-2009 | Partial name — "Screaming Eagle Cabernet" vs full canonical name |
 | SUB-2010 | Size mismatch (750ml submitted, 700ml in catalog) |
 
+### Tier 2 — LLM-Assisted Matching
+
+Tier 2 reads `staging/no_match.json` and `staging/human_review.json` and attempts
+to resolve each record using Claude.
+
+**Model and structured output**: `claude-opus-4-8` with tool use. A single tool,
+`record_match_decision`, defines the exact output schema the model must return:
+`product_id` (catalog ID or null), `confidence` (0–1), and `reason`. Using
+`tool_choice: {type: "tool", name: "..."}` forces exactly one call per request,
+giving a guaranteed structured response with no post-processing.
+
+**Pre-filtering**: before building the prompt, the catalog is filtered to only the
+entries in the same category as the submission. This reduces prompt length and
+focuses the model on the relevant candidates.
+
+**Confidence threshold**: 0.85. This is deliberately high, consistent with the
+false-positive policy. Records below the threshold are routed to
+`llm_review_queue.json` rather than committed. Routing:
+- `confidence >= 0.85` and a product ID found → `llm_matched.json`
+- `confidence >= 0.85` and no product ID → `llm_no_match.json` (LLM is sure it's absent)
+- `confidence < 0.85` → `llm_review_queue.json`
+- API error → `llm_review_queue.json`
+
+**Idempotency via SHA256 cache**: every call is keyed by a SHA256 hash of the
+submission fields plus the candidate list serialised with sorted keys. The result is
+stored in `staging/llm_cache.json`. Re-running Tier 2 on the same data makes zero
+additional API calls.
+
 ---
 
-## Staging Boundary
+## Deliverable 2 — Data Flow Diagram
 
-All output is written to `staging/`. The catalog file is opened read-only and
-never modified. This satisfies the requirement to treat the catalog as production
-data and keep a clear boundary between ingestion and persistence.
+```
+submissions.json
+      │
+      ▼
+  [ ingest ]        stream_submissions() yields one record at a time
+      │
+      ▼
+  [ validate ]      checks required fields, allowed sizes, vintage range
+      │
+      ├── invalid ──────────────────────────────► staging/invalid.json
+      │
+      ▼
+  [ deduplicate ]   exact (same submission_id) and near (same content)
+      │
+      ├── exact_duplicates ─────────────────────► staging/exact_duplicates.json
+      ├── near_duplicates ──────────────────────► staging/near_duplicates.json
+      │
+      ▼
+  [ match ]         normalised string + alias lookup, then attribute gates
+      │
+      ├── exact_match ──────────────────────────► staging/matched.json
+      ├── no_match ─────────────────────────────► staging/no_match.json
+      └── human_review ─────────────────────────► staging/human_review.json
+      │
+      ▼
+  [ report ]        writes summary.json and prints counts to terminal
+
+
+  staging/no_match.json ──────┐
+                              ▼
+  staging/human_review.json ──► [ tier2 / llm_match ]
+                                        │
+                    ┌───────────────────┼───────────────────┐
+                    ▼                   ▼                   ▼
+          llm_matched.json    llm_no_match.json   llm_review_queue.json
+```
 
 ---
 
-## Idempotency and Partial Failure
-
-Running the pipeline twice on the same input produces identical output. Every
-decision is deterministic given the same submissions and catalog.
-
-Partial failure is handled via a checkpoint file written to `staging/checkpoint.json`.
-After each record is successfully written, its `submission_id` is added to the
-checkpoint along with the running counts. If the process dies mid-run, restarting
-it will resume from where it left off rather than reprocessing from the beginning.
-
-On resume the pipeline re-reads the input file from the top to rebuild in-memory
-deduplication state, but skips writing output for any record already in the
-checkpoint. The checkpoint is deleted on successful completion.
-
-Output files are written in **JSON Lines** format (one JSON object per line) so
-records can be appended incrementally without loading the whole file into memory.
-The summary file remains standard JSON as it is a single object written at the end.
-
----
-
-## Scaling Plan
+## Deliverable 3 — Scaling Plan
 
 At 1M records the following break:
 
@@ -180,44 +206,177 @@ At 1M records the following break:
 - **Single-process throughput** — the pipeline is currently single-threaded. Fix:
   batch submissions and process in parallel workers, with each worker writing to
   its own staging partition.
+- **LLM throughput** — Tier 2 makes one sequential API call per record. At scale,
+  use the Anthropic Batch API (`/v1/messages/batches`) to submit all records in one
+  request; it processes them asynchronously at 50% cost and removes per-request
+  latency from the critical path.
 
 ---
 
-## Failure Handling
+## Deliverable 4 — Failure Handling
 
 | Scenario | Behaviour |
 |---|---|
 | Invalid record in input | Caught at validation, written to `invalid.json`, pipeline continues |
 | Duplicate submission_id | Flagged, written to `exact_duplicates.json`, pipeline continues |
 | Catalog file missing | `FileNotFoundError` raised at startup before any processing begins |
-| Pipeline crash mid-run | Staging output may be incomplete; re-run from scratch is safe |
-| LLM API unavailable (Tier 2) | Not yet implemented; design intent is records fall to `human_review.json` |
+| Pipeline crash mid-run | Checkpoint preserves progress; re-run resumes from last saved record |
+| LLM API unavailable | Caught as `anthropic.APIError`, logged to `llm_audit.jsonl`, record routed to `llm_review_queue.json`, pipeline continues |
+
+**Staging boundary**: all output is written to `staging/`. The catalog is opened
+read-only and never modified.
+
+**Idempotency**: running either pipeline script twice on the same input produces
+identical output. Tier 1 uses a checkpoint file (`staging/checkpoint.json`) that
+records each processed `submission_id`; on restart it skips any already-written
+record. Tier 2 uses the SHA256 content-addressed cache (`staging/llm_cache.json`);
+re-running makes zero additional API calls for records already in the cache.
+
+**Output format**: all bucket files are written in JSON Lines format (one object
+per line) so records can be appended incrementally without loading the whole file
+into memory.
 
 ---
 
-## Tier 2 — LLM-Assisted Matching (not yet implemented)
+## Deliverable 5 — AI Usage: Authoring
 
-`staging/human_review.json` and `staging/no_match.json` are the input queues for
-Tier 2. The LLM stage will consume these, attempt resolution, and emit structured
-output with a confidence score and reason. Records below the confidence threshold
-remain in the human review queue.
+This pipeline was built with Claude Code as an interactive coding assistant. The
+following shows one prompt that was iterated on during development of the Tier 2
+LLM matching logic.
+
+**First version of the matching prompt (sent to claude-opus-4-8):**
+
+> You are a product matching expert. Given a product submission and a list of
+> catalog entries, decide if the submission matches any catalog entry. Return your
+> decision as a JSON object with fields: product_id, confidence, reason.
+
+**What was wrong:** The model returned freeform JSON inside a markdown code block,
+requiring fragile regex parsing. The instruction "return JSON" also gave no signal
+about confidence calibration — the model consistently returned confidence of 0.9+
+for partial matches, which would have caused false positives.
+
+**Revised version (what ships):** Tool use replaces freeform JSON. The
+`record_match_decision` tool schema enforces the exact output shape at the API
+level — no parsing needed. The prompt now includes explicit calibration rules:
+
+> *False positives are worse than false negatives: when uncertain, lower your
+> confidence and let the human review. Set confidence >= 0.85 only when you are
+> genuinely certain of the decision.*
+
+This produced well-calibrated confidence scores and eliminated the parsing problem.
+
+---
+
+## Deliverable 6 — AI Usage: System Component
+
+**Where it runs:** `pipeline/llm_match.py`, called once per record that Tier 1
+could not deterministically resolve. Typically 50–60% of submissions reach Tier 2.
+
+**Model:** `claude-opus-4-8` with adaptive thinking (`thinking: {type: "adaptive"}`)
+and `output_config: {effort: "high"}`.
+
+**Output schema** (enforced via tool use):
+
+```json
+{
+  "product_id": "PROD-1005" | null,
+  "confidence": 0.0–1.0,
+  "reason": "one sentence"
+}
+```
+
+**Audit log**: every request (cache hit or miss, success or error) appends one JSON
+line to `staging/llm_audit.jsonl` with `submission_id`, `model`, `input_tokens`,
+`output_tokens`, `product_id`, `confidence`, and `run_at`. This records what
+decision was made, when, and at what cost. The full prompt text is not stored in
+the log — it can be reconstructed deterministically from the original submission
+and catalog using `_build_prompt()` in `llm_match.py`. For a fully self-contained
+audit trail that requires no external files, the prompt text should also be written
+to the log entry.
+
+**Fallback behaviour:** any `anthropic.APIError` is caught without re-raising.
+The record is written to `llm_review_queue.json` and processing continues. The
+error is logged to `llm_audit.jsonl` with a full error message for diagnosis.
+
+**Estimated cost per 1,000 submissions** (first run, no cache):
+
+Assuming ~580 records reach the LLM (58% pass-through rate from Tier 1):
+- Input tokens per call: ~500 (prompt + filtered candidates)
+- Thinking + output tokens per call: ~350
+- 580 × 500 input = 290,000 tokens × $5.00/1M = **$1.45**
+- 580 × 350 output = 203,000 tokens × $25.00/1M = **$5.08**
+- **Total ≈ $6.50 per 1,000 submissions**
+
+Re-runs against the same data cost ~$0 due to the SHA256 cache. At scale, switching
+to the Batch API halves the per-token cost to approximately **$3.25 per 1,000 submissions**.
+
+---
+
+## Deliverable 7 — One Thing the LLM Got Wrong
+
+The Tier 1 constraint requires that a mid-run crash leaves partial progress safe to
+resume. When asked to implement this, the coding assistant (Claude Code) produced a
+pipeline that loaded all records into memory and wrote all output at the end — then
+noted in the README that "for production at scale, a streaming approach would be
+preferable" and marked the partial-failure case as a future improvement.
+
+This was wrong in a specific way: it correctly identified the gap but treated
+writing about it as a substitute for fixing it. The requirement was stated
+explicitly ("import may fail midway — partial progress should be safe"), not
+implied, and acknowledgement in a README does not satisfy a stated constraint.
+
+The error was caught by reading the requirement back against the implementation and
+noticing the mismatch. The fix was to implement the checkpoint system: after each
+record is written, its `submission_id` is appended to `staging/checkpoint.json`.
+On restart the pipeline re-reads the input from the top (to rebuild deduplication
+state) but skips writing output for any ID already in the checkpoint. The checkpoint
+is deleted on clean completion. The test in `tests/test_pipeline.py`
+(`TestCheckpointResume`) simulates a crash mid-run and verifies that a restart
+produces a complete, deduplicated output with no record appearing twice.
+
+The lesson: when a model flags something as a "potential improvement" rather than
+implementing it, check whether it is actually optional or whether it is a
+requirement being quietly deferred.
+
+---
+
+## Deliverable 8 — Eval Results
+
+Run `python eval.py` after `run.py` (and optionally `run_tier2.py`) to generate
+`staging/product_matching_eval.json` and print a summary. Results against the 12
+product-matching submissions, Tier 1 only:
+
+| Metric | Result |
+|---|---|
+| Product ID accuracy | 10 / 12 — 83.3% |
+| Decision accuracy | 12 / 12 — 100.0% |
+| False positives | 0 |
+| FP-weighted score | 100.0% |
+
+**Product ID accuracy** counts a submission correct if the pipeline returned the
+right `product_id` (or null for a confirmed no-match). The two misses are
+SUB-2003 ("Pappy Van Winkle Fifteen" → expected PROD-1005) and SUB-2009
+("Screaming Eagle Cabernet" → expected PROD-1008). Both were correctly deferred
+to Tier 2 rather than guessed wrong — the product_id is not yet resolved, not
+incorrectly resolved.
+
+**Decision accuracy** counts a submission correct if the pipeline's decision
+(e.g. `exact_match`, `no_match`, `invalid`) was in the set of acceptable decisions
+for that record. 12/12 because every Tier 1 decision was appropriate: the two
+deferred records have `no_match` in their acceptable set.
+
+**False positives: 0.** No record was confidently matched to the wrong product.
+The false-positive policy (route to no_match when uncertain) held in every case.
+
+**FP-weighted score** penalises false positives double: `(acceptable - FP_count) /
+(total + FP_count)`. With zero false positives the score equals decision accuracy.
+
+After Tier 2 runs, SUB-2003 and SUB-2009 are expected to resolve to PROD-1005 and
+PROD-1008 respectively, bringing product ID accuracy to 12/12 if both match
+at high confidence.
 
 ---
 
 ## Tier 3 — Scale, Cost, and Evaluation (written response)
 
 *To be completed.*
-
----
-
-## AI Usage — Authoring
-
-*To be completed: one prompt iterated on, showing the first version, what was wrong,
-and the revised version.*
-
----
-
-## AI Usage — System Component
-
-*To be completed: where in the pipeline the LLM runs, the output schema, the
-fallback behaviour, and estimated cost per 1k records.*
