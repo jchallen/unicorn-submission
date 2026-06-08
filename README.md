@@ -380,4 +380,93 @@ at high confidence.
 
 ## Tier 3 — Scale, Cost, and Evaluation (written response)
 
-*To be completed.*
+### 1. Cost — $50 budget for 1M records
+
+At current rates (~$6.50 per 1,000 submissions, 58% pass-through to Tier 2), 1M records
+would cost ~$3,770 — 75× over budget. The fix is a cascade of progressively cheaper
+signals that eliminate obvious cases before they reach the LLM:
+
+1. **Rules (free)** — extend Tier 1 with edit-distance gating. If the submission name is
+   edit-distance > N from every catalog entry, it is a guaranteed no-match. Skip the LLM.
+2. **N-gram similarity (free)** — split names into overlapping character windows and compute
+   overlap scores. "Pappy Van Winkle Fifteen" and "Pappy Van Winkle 15" share most n-grams
+   even though the words differ. Records below a similarity floor are definite no-matches;
+   records above a ceiling are near-certain matches. Only the middle band reaches the LLM.
+3. **Embeddings (cheap)** — generate vector embeddings for every catalog entry at startup
+   (one-time cost). For each submission, embed the name and compute cosine similarity against
+   the catalog. If the highest similarity score is below a threshold, the product is not in
+   the catalog — skip the LLM. Embedding costs ~$0.02/1M tokens vs $5/1M for LLM input.
+4. **LLM via Batch API (expensive, last resort)** — only genuinely ambiguous records reach
+   this stage. The Anthropic Batch API processes requests asynchronously at 50% of the
+   standard per-token cost.
+
+With this cascade, LLM-bound records drop from ~58% to ~1-2%. At 1% = 10,000 LLM calls
+via the Batch API: ~$32.50 total. Under the $50 budget.
+
+---
+
+### 2. Evaluation — accuracy and regression catching
+
+Current accuracy (Tier 1 only, 12 submissions):
+- Product ID accuracy: 10/12 — 83.3%
+- Decision accuracy: 12/12 — 100%
+- False positives: 0
+
+The two product ID misses (SUB-2003, SUB-2009) are correct deferrals to Tier 2, not wrong
+answers. Full results are in `staging/product_matching_eval.json` (run `python eval.py`).
+
+**Catching regressions after a prompt change:** Monitoring the human review queue size is
+a useful signal — if the LLM degrades in confidence, more records pile up in
+`llm_review_queue.json`. However this catches only one failure direction. An overconfident
+LLM making false positives would cause the review queue to shrink, which looks like an
+improvement. That is the worse failure.
+
+The complement: maintain a small golden test set of ~50 hand-labeled records and run it
+before any prompt change. Compare outputs to the known-good baseline. This is snapshot
+testing for the LLM and catches both degradation and overconfidence. The prompt lives in
+version control, so the diff between any two versions is always visible.
+
+---
+
+### 3. Drift — detecting the LLM getting worse over time
+
+The primary signal is bucket distribution over time: graph the counts of `llm_matched`,
+`llm_no_match`, and `llm_review_queue` across imports. A stable pipeline on stable data
+produces stable ratios. A significant shift — more records going to review, or a sudden
+spike in matched records — warrants investigation.
+
+Two additions improve this:
+
+- **Confidence score distribution** — track the distribution of confidence scores, not just
+  bucket counts. A shift from an average match confidence of 0.93 down to 0.87 is an early
+  warning sign before bucket counts visibly change.
+- **Cache-bypassing probe set** — the SHA256 cache means re-running the same data always
+  produces the same decisions, masking any model change. To isolate model drift from data
+  drift, maintain a small fixed probe set that always bypasses the cache. Run it periodically
+  and compare decisions to a known baseline. If the probe set shifts but live data does not,
+  it is model drift. If live data shifts but the probe set does not, it is data drift.
+
+---
+
+### 4. Reversibility — rolling back a bad import
+
+The SHA256 cache in `staging/llm_cache.json` records every decision keyed by content hash,
+which makes it possible to identify exactly which records got bad decisions via
+`staging/llm_audit.jsonl`. However the cache cannot be used to replay back to a good state:
+if the prompt changed and many records got wrong decisions, those wrong decisions are cached
+under the original content hashes. Re-running without clearing the cache would replay the
+same bad decisions.
+
+The correct rollback procedure:
+1. **Identify** — use `llm_audit.jsonl` to find affected records and the timestamp of the
+   bad run.
+2. **Delete** — remove the bad Tier 2 output files (`llm_matched.json`, `llm_no_match.json`,
+   `llm_review_queue.json`).
+3. **Clear** — delete or selectively evict the affected entries from `llm_cache.json`.
+4. **Fix** — correct the prompt in `pipeline/llm_match.py`.
+5. **Re-run** — `python run_tier2.py`. The pipeline is idempotent and the Tier 1 output is
+   unchanged.
+
+The key safety property is that `staging/` is the boundary. Bad LLM decisions never reach
+the production catalog. At scale, versioning staging output by import run ID means a bad run
+can simply be identified and not promoted, with no destructive deletion required.
