@@ -384,24 +384,46 @@ at high confidence.
 
 At current rates (~$6.50 per 1,000 submissions, 58% pass-through to Tier 2), 1M records
 would cost ~$3,770 — 75× over budget. The fix is a cascade of progressively cheaper
-signals that eliminate obvious cases before they reach the LLM:
+signals, each implemented at a specific point in the pipeline:
 
-1. **Rules (free)** — extend Tier 1 with edit-distance gating. If the submission name is
-   edit-distance > N from every catalog entry, it is a guaranteed no-match. Skip the LLM.
-2. **N-gram similarity (free)** — split names into overlapping character windows and compute
-   overlap scores. "Pappy Van Winkle Fifteen" and "Pappy Van Winkle 15" share most n-grams
-   even though the words differ. Records below a similarity floor are definite no-matches;
-   records above a ceiling are near-certain matches. Only the middle band reaches the LLM.
-3. **Embeddings (cheap)** — generate vector embeddings for every catalog entry at startup
-   (one-time cost). For each submission, embed the name and compute cosine similarity against
-   the catalog. If the highest similarity score is below a threshold, the product is not in
-   the catalog — skip the LLM. Embedding costs ~$0.02/1M tokens vs $5/1M for LLM input.
-4. **LLM via Batch API (expensive, last resort)** — only genuinely ambiguous records reach
-   this stage. The Anthropic Batch API processes requests asynchronously at 50% of the
-   standard per-token cost.
+**1. Rules — free, in `pipeline/match.py`**
+Extend Tier 1 with additional deterministic checks. Add a producer + category pre-filter:
+if no catalog entry shares both the same producer and category as the submission, it is a
+guaranteed no-match at zero compute cost. Also add edit-distance gating: if the submission
+name is edit-distance > N from every catalog entry, skip Tier 2 entirely. These run inside
+the existing `match()` function before any fuzzy logic.
 
-With this cascade, LLM-bound records drop from ~58% to ~1-2%. At 1% = 10,000 LLM calls
-via the Batch API: ~$32.50 total. Under the $50 budget.
+**2. N-gram similarity — free, in `pipeline/match.py`**
+Split names into overlapping character windows and compute overlap scores. "Pappy Van Winkle
+Fifteen" and "Pappy Van Winkle 15" share most n-grams even though the words differ. Records
+below a similarity floor are definite no-matches; records above a ceiling are near-certain
+matches. Only the middle band is passed to Tier 2. Sits alongside the edit-distance check
+as another fast pre-filter.
+
+**3. Embeddings — cheap, in `pipeline/llm_match.py`**
+At startup, `tier2.py` pre-computes vector embeddings for every catalog entry and passes the
+index into `llm_match()`. At the top of `llm_match()`, before the cache check or any API
+call, cosine similarity is computed between the submission and the catalog index. If the
+highest similarity score is below a threshold, the product is not in the catalog — return
+`llm_no_match` immediately. Embedding costs ~$0.02/1M tokens vs $5/1M for LLM input.
+
+**4. Model cascade — inside `pipeline/llm_match.py`**
+Before calling `claude-opus-4-8`, make a first call with `claude-haiku-4-5`. If Haiku
+returns confidence >= 0.85, accept the decision. Only escalate to Opus when Haiku is
+uncertain (confidence < 0.85 or ambiguous). Haiku costs ~$1/1M input tokens vs $5/1M for
+Opus — a 5× saving for cases simple enough for the smaller model to resolve confidently.
+The cascade is contained entirely within `llm_match()` with no changes to the calling code
+in `tier2.py`.
+
+**5. Multi-record batching — between `pipeline/tier2.py` and `pipeline/llm_match.py`**
+Rather than one LLM call per record, `tier2.py` groups ambiguous submissions into batches
+of N (e.g. 10) and calls a new `llm_match_batch()` function that sends all submissions in
+a single prompt, receiving a structured decision for each. This reduces the number of API
+calls and amortises per-request overhead. Combined with the Anthropic Batch API (50% cost
+reduction, asynchronous processing), this is the most impactful throughput change at scale.
+
+With the full cascade, LLM-bound records drop from ~58% to ~1–2%. At 1% = 10,000 LLM calls
+via the Batch API with multi-record batching: ~$32.50 total. Under the $50 budget.
 
 ---
 
@@ -467,6 +489,5 @@ The correct rollback procedure:
 5. **Re-run** — `python run_tier2.py`. The pipeline is idempotent and the Tier 1 output is
    unchanged.
 
-The key safety property is that `staging/` is the boundary. Bad LLM decisions never reach
-the production catalog. At scale, versioning staging output by import run ID means a bad run
-can simply be identified and not promoted, with no destructive deletion required.
+At scale, versioning staging output by import run ID means a bad run can simply be identified
+and not promoted, with no destructive deletion required.
